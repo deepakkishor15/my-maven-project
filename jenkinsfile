@@ -1,184 +1,31 @@
-#!/usr/bin/env groovy
-
 pipeline {
     agent any
 
-    parameters {
-        string(name: 'VERSION', defaultValue: '1.0.0', description: 'The version for the build')
-        choice(name: 'DEPLOY_TO_PROD', choices: ['true', 'false'], description: 'Deploy to production')
-    }
-
     environment {
-        MAVEN_HOME = tool 'maven'
-        // PATH = "$MAVEN_HOME/bin:$PATH"
-    }
-
-    options {
-        timeout(time: 1, unit: 'HOURS') // Set a timeout for the entire pipeline
-        buildDiscarder(logRotator(numToKeepStr: '10')) // Keep only the last 10 builds
-        timestamps() // Add timestamps to console output
+        DOCKER_IMAGE = "deepak158/react-sample"
+        DOCKER_CREDENTIALS_ID = "deepak-dockerhub"
     }
 
     stages {
-        stage('Git Checkout Code') {
+        stage('Clone Repository') {
             steps {
-                checkout([$class: 'GitSCM', branches: [[name: '*/main']], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'CleanBeforeCheckout']], submoduleCfg: [], userRemoteConfigs: [[url: 'https://github.com/rageshtamizharasu/my-maven-project.git']]])
+                sh '''
+                rm -rf react || true
+                git clone https://github.com/deepakkishor15/Devops.git react
+                cd react
+                git reset --hard origin/main
+                '''
             }
         }
 
-        stage('Build artifact and Test') {
+        stage('Install Dependencies & Build React App') {
             steps {
-                script {
-                    // Build the Java application and run tests
-                    def buildStatus = sh script: 'mvn clean install', returnStatus: true
-                    if (buildStatus != 0) {
-                        error 'Build failed! Aborting.'
-                    }
-                }
+                sh '''
+                cd react
+                npm install
+                npm run build
+                '''
             }
         }
-
-        stage('Integration Test') {
-            steps {
-                // Run integration tests (in parallel with the next stage)
-                parallel(
-                    "Database": {
-                        sh 'mvn verify -Pdatabase-tests'
-                    },
-                    "API": {
-                        sh 'mvn verify -Papi-tests'
-                    }
-                )
-            }
-        }
-
-        stage('Docker Build and Push to ECR') {
-            steps {
-                script {
-                    // Build the Docker image | Install docker in Jenkins Give Permission to Run time chmod 777 /var/docker.sock
-                    sh "docker build -t project_luna:${params.VERSION} ."
-
-                    // AWS CLI login to ECR
-                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'AWS', accessKeyVariable: 'AWS_ACCESS_KEY_ID', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
-                        sh "aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 790157181476.dkr.ecr.ap-south-1.amazonaws.com"
-                    }
-
-                    // Tag the Docker image
-                    sh "docker tag project_luna:${params.VERSION} 790157181476.dkr.ecr.ap-south-1.amazonaws.com/project_luna:${params.VERSION}"
-
-                    // Push the Docker image to ECR
-                    sh "docker push 790157181476.dkr.ecr.ap-south-1.amazonaws.com/project_luna:${params.VERSION}"
-                }
-            }
-        }
-
-        stage('Deploy to Staging') {
-            when {
-                // Only deploy to staging if the build and integration tests are successful
-                expression {
-                    currentBuild.resultIsBetterOrEqualTo('SUCCESS') &&
-                            env.BRANCH_NAME == 'main'
-                }
-            }
-            steps {
-                sh 'ssh user@staging-server "cd /path/to/deployment && ./deploy.sh"'
-            }
-        }
-//-------------------------------------need to edit---------------------------------
-
-        stage('Deploy to Kubernetes') {
-            when {
-                // Only deploy to Kubernetes if the build and integration tests are successful
-                expression {
-                    currentBuild.resultIsBetterOrEqualTo('SUCCESS') &&
-                            env.BRANCH_NAME == 'main'
-                }
-            }
-            steps {
-                script {
-                    // Apply Kubernetes manifests
-                    sh 'kubectl apply -f kubernetes-manifests/'
-                }
-            }
-        }
-
-        stage('Deploy to Production') {
-            when {
-                // Only deploy to production if the user approves
-                expression { params.DEPLOY_TO_PROD == 'true' }
-            }
-            steps {
-                input 'Deploy to production?'
-                sh 'ssh user@production-server "cd /path/to/deployment && ./deploy.sh"'
-            }
-        }
-
-        stage('Terraform Apply') {
-            when {
-                // Only apply Terraform if the user approves
-                expression { params.DEPLOY_TO_PROD == 'true' }
-            }
-            steps {
-                script {
-                    // Initialize Terraform
-                    sh 'terraform init -backend-config="s3://your-terraform-backend"'
-
-                    // Apply Terraform changes
-                    sh 'terraform apply -auto-approve'
-                }
-            }
-        }
-    }
-
-    post {
-        always {
-            // Clean up any resources, notify, or perform other tasks
-
-            // Send build metrics to Prometheus
-            prometheus([
-                    jobName: 'jenkins',
-                    annotations: [
-                            summary: 'Jenkins build summary',
-                            description: 'Jenkins build metrics sent to Prometheus'
-                    ],
-                    labels: [
-                            buildStatus: currentBuild.result,
-                            buildNumber: currentBuild.number,
-                            pipelineName: env.JOB_NAME,
-                            pipelineRun: env.BUILD_NUMBER,
-                            pipelineResult: env.BUILD_RESULT
-                    ]
-            ])
-        }
-
-        success {
-            // Notify success and ECR push
-            echo "The pipeline ran successfully and pushed version ${params.VERSION} to ECR!"
-            emailext subject: 'Pipeline Successful',
-                    body: "The pipeline ran successfully and pushed version ${params.VERSION} to ECR!",
-                    to: 'your-email@example.com'
-        }
-
-        failure {
-            // Notify failure
-            echo 'The pipeline failed!'
-            emailext subject: 'Pipeline Failed',
-                    body: 'The pipeline failed!',
-                    to: 'your-email@example.com'
-        }
-
-        unstable {
-            // Notify unstable build (optional)
-            echo 'The pipeline is unstable!'
-            emailext subject: 'Pipeline Unstable',
-                    body: 'The pipeline is unstable!',
-                    to: 'your-email@example.com'
-        }
-
-        // Send logs to Splunk on both success and failure
-        splunkLogCollector(url: 'http://your-splunk-collector:8088',
-                channel: 'jenkins',
-                sourcetype: 'jenkins_build_logs',
-                sendResults: true)
     }
 }
